@@ -1789,13 +1789,15 @@ const outputViewStates = {
 		textarea,
 		lineStarts: [],
 		followTail: false,
-		rendering: false
+		rendering: false,
+		renderScheduled: false
 	},
 	ascii: {
 		textarea: asciiOutputTA,
 		lineStarts: [],
 		followTail: false,
-		rendering: false
+		rendering: false,
+		renderScheduled: false
 	}
 };
 
@@ -1845,6 +1847,36 @@ function getOutputLineEnd(value, lineStart) {
 	return newline < 0 ? value.length : newline;
 }
 
+// --- Blank-line "sector" pool ----------------------------------------------
+// The hidden part of the output (above/below the visible window) is
+// represented as bare newlines so the textarea's real scrollHeight still
+// matches the full line count. The previous implementation built that
+// padding with a fresh "\n".repeat(bigNumber) on every scroll event AND on
+// every appended line, so a large conversion (many rows / many animation
+// frames) meant repeatedly allocating a brand-new multi-thousand-character
+// string from scratch just to redraw invisible whitespace. Instead we grow
+// one shared pool in small fixed-size sectors and hand out padding with
+// slice(), so the padding is only ever built once and reused after that.
+const VIEWPORT_SECTOR_LINES = 256;
+let blankLinePool = "";
+
+function ensureBlankPoolCovers(lineCount) {
+	if (lineCount <= blankLinePool.length) {
+		return;
+	}
+	const missing = lineCount - blankLinePool.length;
+	const sectors = Math.ceil(missing / VIEWPORT_SECTOR_LINES);
+	blankLinePool += "\n".repeat(sectors * VIEWPORT_SECTOR_LINES);
+}
+
+function getBlankLines(lineCount) {
+	if (lineCount <= 0) {
+		return "";
+	}
+	ensureBlankPoolCovers(lineCount);
+	return blankLinePool.slice(0, lineCount);
+}
+
 function getOutputViewportMetrics(textareaElement) {
 	const style = getComputedStyle(textareaElement);
 	const fontSize = parseFloat(style.fontSize) || 13;
@@ -1882,7 +1914,7 @@ function renderOutputViewport(name) {
 		visibleParts.push(value.slice(start, end));
 	}
 	const visibleText = visibleParts.join("\n");
-	const renderedValue = "\n".repeat(firstLine) + visibleText + "\n".repeat(totalLines - lastLine);
+	const renderedValue = getBlankLines(firstLine) + visibleText + getBlankLines(totalLines - lastLine);
 	state.rendering = true;
 	textareaElement.value = renderedValue;
 	if (state.followTail) {
@@ -1919,12 +1951,40 @@ function createStringOutputWriter(name) {
 	};
 }
 
+// Scroll fires far more often than the display can actually repaint (a fast
+// trackpad/wheel gesture can queue dozens of events before the next frame).
+// Re-slicing the visible window and rewriting textarea.value on every single
+// one of those events is wasted work and is what made the original viewport
+// feel choppy while scrolling. Coalesce bursts into one render per frame.
+function scheduleViewportRender(name) {
+	const state = getOutputState(name);
+	if (state.renderScheduled) {
+		return;
+	}
+	state.renderScheduled = true;
+	requestAnimationFrame(() => {
+		state.renderScheduled = false;
+		renderOutputViewport(name);
+	});
+}
+
 for (const [name, state] of Object.entries(outputViewStates)) {
 	state.textarea.addEventListener("scroll", () => {
 		if (!state.rendering) {
-			renderOutputViewport(name);
+			scheduleViewportRender(name);
 		}
 	});
+	// visibleLines depends on the textarea's rendered height, which changes on
+	// window resize / orientation change / layout reflow — none of which the
+	// original viewport ever re-measured for, so it could drift out of sync
+	// with what was actually on screen until the next scroll. Watch it directly.
+	if ("function" == typeof ResizeObserver) {
+		new ResizeObserver(() => {
+			if (!state.rendering) {
+				scheduleViewportRender(name);
+			}
+		}).observe(state.textarea);
+	}
 }
 
 document.querySelectorAll(".tab-btn").forEach(button => {
