@@ -546,7 +546,7 @@ const mediaFileInput = document.getElementById("file"), palettemediaFileInput = 
 let originalImageSize = {
 	width: 0,
 	height: 0
-}, originalMimeType = "image/png", sourceExtension = "png", canvasName = "pic2pa.png", outputBlob = null, outputObjectUrl = null, rgbPalette = [], uploadedFileBuffer = null, isTextProcessing = !1, stopTextProcessingFlag = !1, curResizeMode = "=", nextResizeMode = "-";
+}, originalMimeType = "image/png", sourceExtension = "png", canvasName = "pic2pa.png", outputBlob = null, outputObjectUrl = null, originalPreviewObjectUrl = null, rgbPalette = [], uploadedFileBuffer = null, isTextProcessing = !1, stopTextProcessingFlag = !1, curResizeMode = "=", nextResizeMode = "-";
 
 const predefinedPalettes = {
 	arcade: [ "#ffffff", "#ff2121", "#ff93c4", "#ff8135", "#fff609", "#249ca3", "#78dc52", "#003fad", "#87f2ff", "#8e2ec4", "#a4839f", "#5c406c", "#e5cdc4", "#91463d", "#000000" ],
@@ -1788,16 +1788,22 @@ const outputViewStates = {
 	makecode: {
 		textarea,
 		lineStarts: [],
+		visualLineCounts: [],
+		visualLayoutKey: "",
 		followTail: false,
 		rendering: false,
-		renderScheduled: false
+		renderScheduled: false,
+		lastScrollRatio: 0
 	},
 	ascii: {
 		textarea: asciiOutputTA,
 		lineStarts: [],
+		visualLineCounts: [],
+		visualLayoutKey: "",
 		followTail: false,
 		rendering: false,
-		renderScheduled: false
+		renderScheduled: false,
+		lastScrollRatio: 0
 	}
 };
 
@@ -1821,6 +1827,9 @@ function resetOutputString(name, initial = "") {
 	const state = getOutputState(name);
 	const value = String(initial);
 	state.lineStarts.length = 0;
+	state.visualLineCounts.length = 0;
+	state.visualLayoutKey = "";
+	state.lastScrollRatio = 0;
 	setOutputString(name, value);
 	if (value) {
 		state.lineStarts.push(0);
@@ -1829,7 +1838,6 @@ function resetOutputString(name, initial = "") {
 		}
 	}
 }
-
 function appendOutputLine(name, line) {
 	const state = getOutputState(name);
 	const cleanLine = String(line ?? "").replace(/[\r\n]+/g, "");
@@ -1881,11 +1889,48 @@ function getOutputViewportMetrics(textareaElement) {
 	const style = getComputedStyle(textareaElement);
 	const fontSize = parseFloat(style.fontSize) || 13;
 	const lineHeight = parseFloat(style.lineHeight) || fontSize * 1.2;
-	const height = textareaElement.clientHeight || 320;
+	const rect = textareaElement.getBoundingClientRect();
+	const width = Number(textareaElement.width) || textareaElement.clientWidth || rect.width || parseFloat(style.width) || 320;
+	const height = Number(textareaElement.height) || textareaElement.clientHeight || rect.height || parseFloat(style.height) || 320;
+	const paddingLeft = parseFloat(style.paddingLeft) || 0;
+	const paddingRight = parseFloat(style.paddingRight) || 0;
+	const paddingTop = parseFloat(style.paddingTop) || 0;
+	const paddingBottom = parseFloat(style.paddingBottom) || 0;
+	const contentWidth = Math.max(1, width - paddingLeft - paddingRight);
+	const contentHeight = Math.max(lineHeight, height - paddingTop - paddingBottom);
+	const averageCharWidth = Math.max(1, fontSize * .6);
+	const visibleColumns = Math.max(1, Math.floor(contentWidth / averageCharWidth));
 	return {
+		width,
+		height,
+		contentWidth,
+		contentHeight,
 		lineHeight,
-		visibleLines: Math.max(1, Math.ceil(height / lineHeight) + 2)
+		visibleColumns,
+		visibleLines: Math.max(1, Math.ceil(contentHeight / lineHeight) + 2)
 	};
+}
+
+function getOutputVisualLayout(name, value, metrics) {
+	const state = getOutputState(name);
+	const key = `${metrics.width}|${metrics.height}|${metrics.contentWidth}|${metrics.lineHeight}|${state.lineStarts.length}|${value.length}`;
+	if (state.visualLayoutKey === key && state.visualLineCounts.length === state.lineStarts.length) {
+		return state.visualLineCounts;
+	}
+	// The stylesheet intentionally uses white-space: pre, so a source line
+	// does not wrap vertically. Counting estimated width wraps here would add
+	// phantom rows and make the first visible text appear halfway down.
+	const counts = new Array(state.lineStarts.length).fill(1);
+	state.visualLineCounts = counts;
+	state.visualLayoutKey = key;
+	return counts;
+}
+function getTextareaScrollRatio(textareaElement, fallback = 0) {
+	const maxScrollTop = Math.max(0, textareaElement.scrollHeight - textareaElement.clientHeight);
+	if (!maxScrollTop) {
+		return fallback;
+	}
+	return Math.max(0, Math.min(1, textareaElement.scrollTop / maxScrollTop));
 }
 
 function renderOutputViewport(name) {
@@ -1898,15 +1943,32 @@ function renderOutputViewport(name) {
 	}
 	if (!totalLines) {
 		state.rendering = true;
+		state.lastScrollRatio = 0;
 		textareaElement.value = "";
 		textareaElement.scrollTop = 0;
 		state.rendering = false;
 		return;
 	}
 	const metrics = getOutputViewportMetrics(textareaElement);
-	const previousScrollTop = textareaElement.scrollTop;
-	const firstLine = state.followTail ? Math.max(0, totalLines - metrics.visibleLines) : Math.max(0, Math.floor(previousScrollTop / metrics.lineHeight) - 1);
-	const lastLine = Math.min(totalLines, firstLine + metrics.visibleLines);
+	const visualLineCounts = getOutputVisualLayout(name, value, metrics);
+	const totalVisualLines = visualLineCounts.reduce((sum, count) => sum + count, 0);
+	const previousRatio = state.followTail ? 1 : getTextareaScrollRatio(textareaElement, state.lastScrollRatio);
+	state.lastScrollRatio = previousRatio;
+	const maxVisualFirstLine = Math.max(0, totalVisualLines - metrics.visibleLines);
+	const requestedVisualFirstLine = Math.round(previousRatio * maxVisualFirstLine);
+	let firstLine = 0;
+	let visualBeforeFirst = 0;
+	while (firstLine < totalLines && visualBeforeFirst + visualLineCounts[firstLine] <= requestedVisualFirstLine) {
+		visualBeforeFirst += visualLineCounts[firstLine];
+		firstLine += 1;
+	}
+	const targetVisualEnd = requestedVisualFirstLine + metrics.visibleLines;
+	let lastLine = firstLine;
+	let visualThroughLast = visualBeforeFirst;
+	while (lastLine < totalLines && visualThroughLast < targetVisualEnd) {
+		visualThroughLast += visualLineCounts[lastLine];
+		lastLine += 1;
+	}
 	const visibleParts = [];
 	for (let line = firstLine; line < lastLine; line += 1) {
 		const start = state.lineStarts[line];
@@ -1914,18 +1976,14 @@ function renderOutputViewport(name) {
 		visibleParts.push(value.slice(start, end));
 	}
 	const visibleText = visibleParts.join("\n");
-	const renderedValue = getBlankLines(firstLine) + visibleText + getBlankLines(totalLines - lastLine);
+	const renderedValue = getBlankLines(visualBeforeFirst) + visibleText + getBlankLines(totalVisualLines - visualThroughLast);
 	state.rendering = true;
 	textareaElement.value = renderedValue;
-	if (state.followTail) {
-		textareaElement.scrollTop = textareaElement.scrollHeight;
-	} else {
-		const maxScrollTop = Math.max(0, textareaElement.scrollHeight - textareaElement.clientHeight);
-		textareaElement.scrollTop = Math.min(previousScrollTop, maxScrollTop);
-	}
+	const maxScrollTop = Math.max(0, textareaElement.scrollHeight - textareaElement.clientHeight);
+	textareaElement.scrollTop = previousRatio * maxScrollTop;
+	state.lastScrollRatio = getTextareaScrollRatio(textareaElement, previousRatio);
 	state.rendering = false;
 }
-
 function renderOutputViewports() {
 	renderOutputViewport("makecode");
 	renderOutputViewport("ascii");
@@ -1970,9 +2028,12 @@ function scheduleViewportRender(name) {
 
 for (const [name, state] of Object.entries(outputViewStates)) {
 	state.textarea.addEventListener("scroll", () => {
-		if (!state.rendering) {
-			scheduleViewportRender(name);
+		if (state.rendering) {
+			return;
 		}
+		state.followTail = false;
+		state.lastScrollRatio = getTextareaScrollRatio(state.textarea, state.lastScrollRatio);
+		scheduleViewportRender(name);
 	});
 	// visibleLines depends on the textarea's rendered height, which changes on
 	// window resize / orientation change / layout reflow — none of which the
@@ -2156,7 +2217,15 @@ function setOutputBlob(e) {
 	outputImage.setAttribute("aria-hidden", "false"));
 }
 
+function revokeOriginalPreviewObjectUrl() {
+	if (originalPreviewObjectUrl) {
+		URL.revokeObjectURL(originalPreviewObjectUrl);
+		originalPreviewObjectUrl = null;
+	}
+}
+
 function resetLoadedState() {
+	revokeOriginalPreviewObjectUrl();
 	resetOutputString("makecode");
 	resetOutputString("ascii");
 	makecodeStringOutput = "";
@@ -2218,6 +2287,25 @@ function canvasPreviewImage(e) {
 	if (!(e instanceof HTMLCanvasElement)) return e;
 	const t = new Image;
 	return t.alt = "Original image preview", t.src = e.toDataURL("image/png"), t;
+}
+
+function createOriginalReviewElement(file) {
+	revokeOriginalPreviewObjectUrl();
+	originalPreviewObjectUrl = URL.createObjectURL(file);
+	if (sourceMime(file) === "video/webm") {
+		const video = document.createElement("video");
+		video.autoplay = true;
+		video.loop = true;
+		video.muted = true;
+		video.playsInline = true;
+		video.setAttribute("aria-label", "Original media preview");
+		video.src = originalPreviewObjectUrl;
+		return video;
+	}
+	const image = new Image;
+	image.alt = "Original image preview";
+	image.src = originalPreviewObjectUrl;
+	return image;
 }
 
 async function inspectAnimationSource(e) {
@@ -2319,7 +2407,7 @@ colorpad.querySelectorAll(".color-pair").forEach((e, t) => {
 			if ("video/webm" === t || isAnimatedBuffer(uploadedFileBuffer, t)) {
 				const a = await decodeAnimation(uploadedFileBuffer, t), n = await inspectAnimationSource(a);
 				if (!n.first) throw new Error("No decodable animation frames were found.");
-				const i = canvasPreviewImage(n.first.image), o = n.frameCount || a.frameCount || 0;
+				const i = createOriginalReviewElement(e), o = n.frameCount || a.frameCount || 0;
 				n.visuallyStatic ? (animSource = null, showLoadedPreview(i, n.first.width, n.first.height), 
 				uploadedFileBuffer = null, statusDiv.textContent = `Ready: "${e.name}" Loaded as a static image.`, 
 				addToSessionLog("IMAGE", `Loaded "${t}" as static output (${o || 1} visually identical frame(s)).`)) : (animSource = a, 
@@ -2327,13 +2415,19 @@ colorpad.querySelectorAll(".color-pair").forEach((e, t) => {
 				addToSessionLog("ANIM", `Loaded "${t}" as a streaming animation source${o ? ` with ${o} frame(s)` : ""}.`)), 
 				releaseFrame(n.first);
 			} else {
-				const a = URL.createObjectURL(e), n = new Image;
-				n.onload = () => {
-					URL.revokeObjectURL(a), showLoadedPreview(n, n.naturalWidth, n.naturalHeight), statusDiv.textContent = `Ready: "${e.name}" Loaded Successfully.`, 
+				const a = createOriginalReviewElement(e);
+				const onLoaded = () => {
+					const width = a.videoWidth || a.naturalWidth;
+					const height = a.videoHeight || a.naturalHeight;
+					showLoadedPreview(a, width, height);
+					statusDiv.textContent = `Ready: "${e.name}" Loaded Successfully.`;
 					addToSessionLog("IMAGE", `Loaded "${t}" source image.`);
-				}, n.onerror = () => {
-					URL.revokeObjectURL(a), displayErrorPopup("Image Decoding Exception", "Unable to decode this image file.", "The file may be corrupted or unsupported.");
-				}, n.src = a;
+				};
+				a.addEventListener("loadedmetadata", onLoaded, { once: true });
+				a.addEventListener("load", onLoaded, { once: true });
+				a.addEventListener("error", () => {
+					displayErrorPopup("Image Decoding Exception", "Unable to decode this image file.", "The file may be corrupted or unsupported.");
+				}, { once: true });
 			}
 		} catch (e) {
 			displayErrorPopup("Animation Decode Error", e.message, e.stack), resetLoadedState();
@@ -2412,7 +2506,7 @@ function releaseFrame(e) {
 }
 
 function updateCalculatedDimensions() {
-	if (!document.querySelector("#original-preview-zone img, #original-preview-zone canvas")) return;
+	if (!document.querySelector("#original-preview-zone img, #original-preview-zone video, #original-preview-zone canvas")) return;
 	const e = (e, t) => {
 		inputWidth.disabled = e, inputHeight.disabled = e, inputFactor.disabled = t;
 	};
@@ -2707,7 +2801,7 @@ document.querySelectorAll('input[name="resize"], #factor').forEach(e => {
 		renderOutputViewport("makecode");
 		const fr = document.getElementById("reset");
 		try {
-			const e = document.querySelector("#original-preview-zone img, #original-preview-zone canvas");
+			const e = document.querySelector("#original-preview-zone img, #original-preview-zone video, #original-preview-zone canvas");
 			if (!e) return;
 			fr.disabled = true;
 			isProcessing = true;
@@ -2756,7 +2850,7 @@ document.querySelectorAll('input[name="resize"], #factor').forEach(e => {
 	document.getElementById('status').textContent = 'System Status: Awaiting Image Upload Asset...';
 	resetLoadedState();
 	previewContainer.style.display = "none";
-	const picEnv = document.querySelector("#original-preview-zone img, #original-preview-zone canvas")
+	const picEnv = document.querySelector("#original-preview-zone img, #original-preview-zone video, #original-preview-zone canvas")
 	if (!!picEnv) picEnv.value = null;
 	mediaFileInput.value = null;
 });
